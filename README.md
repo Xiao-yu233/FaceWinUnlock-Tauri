@@ -7,8 +7,6 @@
 
 [天翼云 访问码：u9gv](https://cloud.189.cn/t/FNvee2mQfumm)
 
-[抖音ID: czm529797 提供的公益站点](https://download.mingqwq.top/)
-
 ## 📖 前言
 
 这个项目的诞生源于一次小小的“心理落差”：
