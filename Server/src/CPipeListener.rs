@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle, sleep},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use windows::Win32::{
     Foundation::{LPARAM, LRESULT, WPARAM},
@@ -19,8 +19,7 @@ use windows::Win32::{
 use windows_core::HSTRING;
 
 use crate::{
-    Pipe::{read, Client, Server},
-    SharedCredentials
+    read_facewinunlock_registry, Pipe::{read, Client, Server}, SharedCredentials
 };
 
 // 包装 COM 接口，使其可以跨线程传输
@@ -43,34 +42,15 @@ pub struct CPipeListener {
 // 10点左右尝试写了一个Demo，居然成功了！！！❤ヾ(≧▽≦*)o
 static mut MOUSE_HOOK_ID: HHOOK = HHOOK(std::ptr::null_mut());
 static mut KEYBOARD_HOOK_ID: HHOOK = HHOOK(std::ptr::null_mut());
+// 鼠标键盘hook标志
+static IS_MOUSE_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+static IS_KEYBOARD_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+
 // 是否可以发送run
 static IS_SEND_RUN: AtomicBool = AtomicBool::new(false);
-// 记录上一次发送管道消息的时间戳（毫秒）
-static mut LAST_SEND_TIME: u128 = 0;
-// 检查是否可以发送（避免短时间重复发送）
-fn can_send() -> bool {
-    unsafe {
-        // 获取当前时间戳（毫秒）
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-
-        // UI端做限制
-        let delay: u128 = 500;
-
-        // 如果距离上次发送超过最小间隔，更新时间并允许发送
-        if now - LAST_SEND_TIME >= delay {
-            LAST_SEND_TIME = now;
-            true
-        } else {
-            false
-        }
-    }
-}
 unsafe extern "system" fn hook_fn(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
-        if can_send() {
+        if !IS_SEND_RUN.load(Ordering::SeqCst) {
             IS_SEND_RUN.store(true, Ordering::SeqCst);
         }
     }
@@ -80,12 +60,12 @@ unsafe extern "system" fn hook_fn(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
 
 unsafe extern "system" fn keyboard_hook_fn(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
-        if can_send() {
+        if !IS_SEND_RUN.load(Ordering::SeqCst) {
             IS_SEND_RUN.store(true, Ordering::SeqCst);
         }
     }
 
-    unsafe { CallNextHookEx(Some(MOUSE_HOOK_ID), code, wparam, lparam) }
+    unsafe { CallNextHookEx(Some(KEYBOARD_HOOK_ID), code, wparam, lparam) }
 }
 
 impl CPipeListener {
@@ -126,6 +106,7 @@ impl CPipeListener {
             error!("设置鼠标钩子失败！错误码: {:?}", hook_id.err());
         } else {
             unsafe { MOUSE_HOOK_ID = hook_id.unwrap() };
+            IS_MOUSE_HOOK_INSTALLED.store(true, Ordering::SeqCst);
         }
 
         // 注册键盘钩子
@@ -134,6 +115,7 @@ impl CPipeListener {
             error!("设置键盘钩子失败！错误码: {:?}", hook_id.err());
         } else {
             unsafe { KEYBOARD_HOOK_ID = hook_id.unwrap() };
+            IS_KEYBOARD_HOOK_INSTALLED.store(true, Ordering::SeqCst);
         }
 
         let running = Arc::new(AtomicBool::new(true));
@@ -170,13 +152,11 @@ impl CPipeListener {
                                     creds.password = password.to_string();
                                     creds.is_ready = true;
 
-                                    info!("成功解析用户信息: {}", user_name);
+                                    info!("收到用户名 {}", user_name);
 
                                     // 触发登录逻辑
                                     is_unlocked_clone.store(true, Ordering::SeqCst);
                                     let _ = events_wrapper.0.CredentialsChanged(advise_context);
-                                } else {
-                                    warn!("收到未知格式的数据: {}", content);
                                 }
                             }
                             Err(_e) => {
@@ -192,29 +172,46 @@ impl CPipeListener {
             info!("管道Server 线程已彻底退出");
         });
 
+        let mut connect_client = false;
+        if let Ok(result) = read_facewinunlock_registry("CONNECT_TO_PIPE") {
+            if result.as_str() == "1" {
+                connect_client = true;
+            }
+        } else {
+            warn!("注册表配置读取失败!");
+        }
         let running_client = running.clone();
         let client_thread = thread::spawn(move || {
             info!("CPipeListener::start - 进入管道Client线程");
-            let mut client = None;
-            while running_client.load(Ordering::SeqCst) {
-                if let Ok(client_i) =
-                    Client::new(HSTRING::from(r"\\.\pipe\MansonWindowsUnlockRustClient"))
-                {
-                    info!("Client管道连接成功.");
-                    client = Some(client_i);
-                    break;
-                }
-                sleep(Duration::from_millis(100));
-            }
 
-            if let Some(client) = client {
+            if connect_client {
                 while running_client.load(Ordering::SeqCst) {
-                    if IS_SEND_RUN.load(Ordering::SeqCst) {
-                        IS_SEND_RUN.store(false, Ordering::SeqCst);
-                        if let Err(e) = crate::Pipe::write(client.handle, String::from("run")) {
-                            println!("向客户端写入数据失败: {:?}", e);
+                    if let Ok(client_i) =
+                        Client::new(HSTRING::from(r"\\.\pipe\MansonWindowsUnlockRustUnlock"))
+                    {
+                        loop {
+                            // 运行状态为false，则退出循环
+                            if !running_client.load(Ordering::SeqCst) {
+                                break;
+                            }
+
+                            // 如果有数据，则发送
+                            if IS_SEND_RUN.load(Ordering::SeqCst) {
+                                if let Err(e) = crate::Pipe::write(client_i.handle, String::from("run")) {
+                                    error!("向管道写入数据失败：{:?}", e);
+                                }
+                                IS_SEND_RUN.store(false, Ordering::SeqCst);
+                                
+                                // 发送完成
+                                break;
+                            }
+
+                            // 休眠
+                            sleep(Duration::from_millis(500));
                         }
+                        
                     }
+                    sleep(Duration::from_millis(500));
                 }
             }
 
@@ -236,7 +233,15 @@ impl Drop for CPipeListener {
     fn drop(&mut self) {
         info!("销毁一个 CPipeListener");
         // 卸载鼠标钩子
-        unsafe { UnhookWindowsHookEx(MOUSE_HOOK_ID).unwrap() };
-        unsafe { UnhookWindowsHookEx(KEYBOARD_HOOK_ID).unwrap() };
+        if IS_MOUSE_HOOK_INSTALLED.load(Ordering::SeqCst) {
+            unsafe { let _ = UnhookWindowsHookEx(MOUSE_HOOK_ID); };
+            unsafe { MOUSE_HOOK_ID = HHOOK(std::ptr::null_mut()) };
+            IS_MOUSE_HOOK_INSTALLED.store(false, Ordering::SeqCst);
+        }
+        if IS_KEYBOARD_HOOK_INSTALLED.load(Ordering::SeqCst) {
+            unsafe { let _ = UnhookWindowsHookEx(KEYBOARD_HOOK_ID); };
+            unsafe { KEYBOARD_HOOK_ID = HHOOK(std::ptr::null_mut()) };
+            IS_KEYBOARD_HOOK_INSTALLED.store(false, Ordering::SeqCst);
+        }
     }
 }
